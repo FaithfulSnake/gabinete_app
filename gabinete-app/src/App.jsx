@@ -6,7 +6,7 @@ import {
   ChevronRight, ChevronLeft, ChevronUp, ChevronDown, Zap, X, Plus,
   Trash2, Download, Upload, Mail, Wand2, BadgeCheck, AlertTriangle,
   CircleDot, Activity, Bell, Eye, ArrowRight, Clock, Newspaper, Calendar, Pin,
-  Settings, Copy, ExternalLink
+  Settings, Copy, ExternalLink, RefreshCw
 } from "lucide-react";
 
 /* ============ tokens ============ */
@@ -21,7 +21,7 @@ const appStorage = {
   async set(k, v) { localStorage.setItem(k, v); return {}; },
 };
 const CFG_KEY = "gab-cfg-v1";
-const CFG_DEFAULT = { provider: "gemini", geminiKey: "", claudeKey: "", repoUrl: "", geminiModel: "gemini-2.5-flash" };
+const CFG_DEFAULT = { provider: "gemini", geminiKey: "", claudeKey: "", repoUrl: "", geminiModel: "gemini-2.5-flash", ghToken: "", sheetCsvUrl: "" };
 function loadCfg() {
   try { return { ...CFG_DEFAULT, ...(JSON.parse(localStorage.getItem(CFG_KEY) || "{}")) }; }
   catch (e) { return { ...CFG_DEFAULT }; }
@@ -29,6 +29,20 @@ function loadCfg() {
 function saveCfgLS(c) { localStorage.setItem(CFG_KEY, JSON.stringify(c)); }
 
 const CSS = `
+
+/* utilities de layout (no artefato vinham do ambiente; aqui precisam existir) */
+.flex{display:flex}.grid{display:grid}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}
+.items-center{align-items:center}.items-start{align-items:flex-start}.items-end{align-items:flex-end}
+.items-baseline{align-items:baseline}.items-stretch{align-items:stretch}
+.justify-between{justify-content:space-between}.justify-center{justify-content:center}.justify-end{justify-content:flex-end}
+.gap-1{gap:4px}.gap-1\\.5{gap:6px}.gap-2{gap:8px}.gap-3{gap:12px}.gap-4{gap:16px}
+.mb-1{margin-bottom:4px}.mb-2{margin-bottom:8px}.mb-3{margin-bottom:12px}.mb-4{margin-bottom:16px}.mb-5{margin-bottom:20px}.mb-6{margin-bottom:24px}
+.mt-2{margin-top:8px}.mt-3{margin-top:12px}.mt-4{margin-top:16px}.mt-8{margin-top:32px}
+.text-left{text-align:left}
+@keyframes spin{to{transform:rotate(360deg)}}
+.animate-spin{animation:spin 1s linear infinite}
+button{font-family:inherit}
+a{color:inherit}
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 * { box-sizing: border-box; }
 .appfont { font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', Inter, 'Segoe UI', sans-serif; }
@@ -131,6 +145,62 @@ const CSS = `
   .hide-m { display: none !important; }
 }
 `;
+
+
+/* ============ integrações reais ============ */
+function parseRepo(cfg) {
+  const m = (cfg.repoUrl || "").match(/github\.com\/([^\/\s]+)\/([^\/\s]+)/);
+  return m ? { owner: m[1], repo: m[2].replace(/\.git$/, "") } : null;
+}
+function ghHeaders(cfg) {
+  const h = { Accept: "application/vnd.github+json" };
+  if (cfg.ghToken) h.Authorization = "Bearer " + cfg.ghToken;
+  return h;
+}
+async function listarArquivosRobos(cfg) {
+  const r = parseRepo(cfg);
+  if (!r) throw new Error("Configure o repositório dos robôs em Ajustes.");
+  const res = await fetch(`https://api.github.com/repos/${r.owner}/${r.repo}/contents/data`, { headers: ghHeaders(cfg) });
+  if (res.status === 404) throw new Error("Pasta data ainda não existe no repositório (rode o robô uma vez).");
+  if (res.status === 403) throw new Error("GitHub limitou as consultas agora. Tente de novo em alguns minutos ou cole um token em Ajustes.");
+  if (!res.ok) throw new Error("GitHub respondeu " + res.status);
+  const lista = await res.json();
+  return (Array.isArray(lista) ? lista : []).filter((f) => f.name.endsWith(".json")).sort((a, b) => (a.name < b.name ? 1 : -1));
+}
+async function dispararRobo(cfg, inputs) {
+  const r = parseRepo(cfg);
+  if (!r) return { ok: false, msg: "Configure o repositório dos robôs em Ajustes." };
+  if (!cfg.ghToken) return { ok: false, msg: "Para disparar daqui, cole o token do GitHub em Ajustes (1 minuto para criar)." };
+  const res = await fetch(`https://api.github.com/repos/${r.owner}/${r.repo}/actions/workflows/robos.yml/dispatches`, {
+    method: "POST", headers: { ...ghHeaders(cfg), "Content-Type": "application/json" },
+    body: JSON.stringify({ ref: "main", inputs }),
+  });
+  if (res.status === 204) return { ok: true, msg: "Robô disparado. O resultado chega na sincronização em 2 a 4 minutos." };
+  if (res.status === 401 || res.status === 403) return { ok: false, msg: "O token não tem permissão de Actions neste repositório. Refaça o token (Actions: leitura e escrita)." };
+  if (res.status === 404) return { ok: false, msg: "Não achei o workflow robos.yml no repositório. Confira se a pasta .github subiu." };
+  return { ok: false, msg: "GitHub respondeu " + res.status + " ao disparar." };
+}
+function montarPromptClaude(titulo, dados) {
+  return `Você é o assistente do escritório Adriana Matos Advocacia (TCE/MA). Tarefa: ${titulo}.\nUse SOMENTE os dados abaixo, não invente fatos, números de processo nem datas; onde faltar, escreva [PREENCHER]. Documentos formais em Garamond 12. Nunca use travessões.\n\n=== DADOS EXTRAÍDOS PELO ROBÔ/SISTEMA ===\n${dados}`;
+}
+async function abrirNoClaude(titulo, dados, toast) {
+  const texto = montarPromptClaude(titulo, dados);
+  try { await navigator.clipboard.writeText(texto); } catch (e) {}
+  window.open("https://claude.ai/new?q=" + encodeURIComponent(texto.slice(0, 6000)), "_blank");
+  if (toast) toast("Prompt copiado e Claude aberto. Se o campo vier vazio, é só colar.");
+}
+function parseCsvPrazos(txt) {
+  const linhas = txt.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const sep = (linhas[0] || "").includes(";") ? ";" : ",";
+  const rows = [];
+  for (const l of linhas) {
+    const c = l.split(sep).map((x) => x.replace(/^"|"$/g, "").trim());
+    const dias = parseInt(c[2], 10);
+    if (!c[0] || isNaN(dias)) continue;
+    rows.push({ title: c[0], who: c[1] || "", days: dias });
+  }
+  return rows;
+}
 
 /* ============ IA ============ */
 const OFFICE_CTX = `Contexto: escritório Adriana Matos Advocacia (São Luís, MA), atuação perante o TCE/MA para cerca de 35 clientes municipais (prefeituras, câmaras municipais e ex-gestores). Equipe: Dra. Adriana Santos Matos, Dra. Bruna Raquel Silva Machado e o estagiário Carlos. Rotinas: monitoramento diário do Diário Oficial do TCE/MA, informativos timbrados por município, relatórios de acompanhamento processual, petições (prescrição intercorrente, prorrogação de prazo, sustentação oral) e preparação de pautas do Pleno. Documentos formais em Garamond 12. Nunca use travessões em nenhum texto.`;
@@ -280,13 +350,7 @@ const KIND_TAG = {
   doe: { label: "DIÁRIO", color: "#8A6D1F" },
   info: { label: "SISTEMA", color: "#6B665C" },
 };
-const DEFAULT_FEED = [
-  { id: 1, kind: "prazo", text: "Multa em Barreirinhas · recurso já negado · prazo de 15 dias correndo", ago: "agora", pinned: false },
-  { id: 2, kind: "pauta", text: "18ª Sessão do Pleno · quinta · 4 itens da carteira em pauta", ago: "quinta", pinned: true },
-  { id: 3, kind: "despacho", text: "Márcio Araújo · novo despacho no PCA 2023, concluso ao relator", ago: "há 20 min", pinned: false },
-  { id: 4, kind: "doc", text: "REL-02 de Amilcar Rocha enviado à fila de revisão", ago: "há 1 h", pinned: false },
-  { id: 5, kind: "doe", text: "Edital de débitos cita 3 clientes: Primeira Cruz, Montes Altos, Tutóia", ago: "há 2 h", pinned: false },
-];
+const DEFAULT_FEED = [];
 
 /* ============ átomos ============ */
 function Title({ children, sub }) {
@@ -296,22 +360,28 @@ function Spin() { return <Loader2 size={15} className="animate-spin" />; }
 
 function WordModal({ doc, onClose }) {
   if (!doc) return null;
-  const body = doc.html || `<h1>${doc.name}</h1><p style="color:#6B7280">Este modelo ainda não tem estrutura extraída de um arquivo. Especificação registrada:</p><p><b>${doc.spec || ""}</b></p><p>${doc.uses ? "Uso: " + doc.uses : ""}</p><p style="color:#9C3A32">Para virar um modelo com formato fiel, envie um .docx do escritório no botão “Extrair modelo”.</p>`;
+  const temBase = !!doc.html;
   return (
     <div className="modal-bg fade-up" onClick={onClose}>
-      <div className="word" onClick={(e) => e.stopPropagation()}>
-        <div className="word-bar">
-          <FileText size={16} />
-          <span style={{ fontSize: 14, fontWeight: 600, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{doc.name || doc.id} — Modo de leitura</span>
-          <button onClick={onClose} style={{ background: "rgba(255,255,255,.2)", border: "none", borderRadius: 6, width: 26, height: 26, cursor: "pointer", color: "#fff", display: "inline-flex", alignItems: "center", justifyContent: "center" }}><X size={15} /></button>
-        </div>
-        <div className="word-tool">
-          {["Arquivo", "Página Inicial", "Inserir", "Layout"].map((t, i) => (
-            <span key={t} className="appfont" style={{ fontSize: 12.5, color: i === 1 ? "#2B579A" : "#605E5C", padding: "2px 8px", borderRadius: 4, background: i === 1 ? "#fff" : "transparent", fontWeight: i === 1 ? 600 : 400 }}>{t}</span>
-          ))}
-        </div>
-        <div className="word-page scroll-thin">
-          <div className="word-sheet" dangerouslySetInnerHTML={{ __html: body }} />
+      <div className="word" onClick={(e) => e.stopPropagation()} style={{ background: "transparent", boxShadow: "none" }}>
+        <div className="glass" style={{ borderRadius: 20, overflow: "hidden", display: "flex", flexDirection: "column", maxHeight: "88vh" }}>
+          <div className="flex items-center gap-2" style={{ padding: "12px 16px", borderBottom: "1px solid rgba(255,255,255,.45)" }}>
+            <Eye size={16} style={{ color: T.goldDark }} />
+            <span style={{ fontSize: 14, fontWeight: 700, color: T.ink, flex: 1, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{doc.name || doc.id} · prévia de leitura</span>
+            <button onClick={onClose} className="cbtn" style={{ width: 32, height: 32 }}><X size={15} /></button>
+          </div>
+          <div className="word-page scroll-thin" style={{ background: "rgba(234,233,232,.6)" }}>
+            {temBase ? (
+              <div className="word-sheet" dangerouslySetInnerHTML={{ __html: doc.html }} />
+            ) : (
+              <div className="word-sheet">
+                <h1 style={{ fontSize: "17pt" }}>{doc.name}</h1>
+                <p><b>{doc.spec || ""}</b></p>
+                {doc.uses && <p>Uso: {doc.uses}</p>}
+                <p style={{ color: "#9C3A32" }}>Este modelo ainda não tem estrutura real extraída. Envie o .docx original do escritório no botão Extrair modelo e a prévia passa a mostrar o documento de verdade.</p>
+              </div>
+            )}
+          </div>
         </div>
       </div>
     </div>
@@ -383,7 +453,7 @@ function NewsBand({ feed, setFeed }) {
   );
 }
 
-function HomeView({ deadlines, setDeadlines, monitors, categories, feed, setFeed, addFeed, go, toast }) {
+function HomeView({ deadlines, setDeadlines, monitors, categories, feed, setFeed, addFeed, go, toast, syncNow, syncing, quick, cfg }) {
   const SHEETS = ["Prazos 2026", "Prazos TCE-MA", "Cível e Trabalhista"];
   const [adding, setAdding] = useState(false);
   const [plan, setPlan] = useState(false);
@@ -425,30 +495,6 @@ function HomeView({ deadlines, setDeadlines, monitors, categories, feed, setFeed
 
   const catName = (id) => (categories.find((c) => c.id === id) || {}).name || "";
 
-  const roboRef = useRef(null);
-  const importRobo = async (file) => {
-    if (!file) return;
-    try {
-      const data = JSON.parse(await file.text());
-      const pubs = data.publicacoes || data.achados || [];
-      if (!Array.isArray(pubs) || !pubs.length) { toast("Arquivo sem achados. É o JSON gerado pelo robô?"); return; }
-      let novos = 0, prazos = 0;
-      const feedItems = [];
-      const dl = [...deadlines];
-      pubs.slice(0, 12).forEach((p) => {
-        const tag = ((p.tags && p.tags[0]) || p.tag || "DIÁRIO").toString().toUpperCase();
-        const kind = tag.includes("MULTA") || p.urgente ? "prazo" : tag.includes("PAUTA") ? "pauta" : "doe";
-        feedItems.push({ id: Date.now() + Math.random(), kind, text: `${p.municipio || "Carteira"}: ${(p.trecho || p.resumo || "publicação encontrada").slice(0, 110)}`, ago: "robô · agora", pinned: false });
-        novos++;
-        if (p.urgente && p.prazo_dias) { dl.push({ id: Date.now() + Math.random(), title: (p.resumo || p.trecho || "Prazo do Diário").slice(0, 70), who: p.municipio || "", days: parseInt(p.prazo_dias, 10) || 15, sheet }); prazos++; }
-      });
-      setFeed([...feedItems, ...feed].slice(0, 40));
-      if (prazos) setDeadlines(dl.sort((a, b) => a.days - b.days));
-      toast(`Robô: ${novos} achados importados${prazos ? `, ${prazos} prazos criados` : ""}`);
-    } catch (e) { toast((e && e.friendly) || "Não consegui ler este arquivo. Envie o .json do robô."); }
-    if (roboRef.current) roboRef.current.value = "";
-  };
-
   return (
     <div className="fade-up">
       <div className="flex items-end justify-between flex-wrap gap-3 mb-5">
@@ -457,13 +503,31 @@ function HomeView({ deadlines, setDeadlines, monitors, categories, feed, setFeed
           <p className="sub">Domingo, 12 de julho de 2026 · o painel do escritório</p>
         </div>
         <div className="flex gap-2 items-center flex-wrap">
-          <input ref={roboRef} type="file" accept=".json,application/json" style={{ display: "none" }} onChange={(e) => importRobo(e.target.files && e.target.files[0])} />
-          <button onClick={() => roboRef.current && roboRef.current.click()} className="pill appfont" style={{ fontSize: 13.5 }}><Bot size={16} /> Robô (.json)</button>
+          <button onClick={() => syncNow(false)} className="pill appfont" style={{ fontSize: 13.5 }} title="Buscar agora os resultados dos robôs no GitHub"><RefreshCw size={15} className={syncing ? "animate-spin" : ""} /> {syncing ? "Sincronizando..." : "Sincronizar robôs"}</button>
           <button onClick={() => go("chat")} className="btng appfont" style={{ fontSize: 15, padding: "12px 20px" }}><MessageSquare size={17} /> Assistente <ArrowRight size={15} /></button>
         </div>
       </div>
 
       <NewsBand feed={feed} setFeed={setFeed} />
+
+      <div className="grid gap-3 mb-5" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(215px, 1fr))" }}>
+        {[
+          { id: "spe", t: "Relatório de processos", d: "SPE · por gestor e município", I: Activity },
+          { id: "doe14", t: "Ler o Diário agora", d: "Fora do horário das 14h", I: Newspaper },
+          { id: "pauta", t: "Pauta de sessão", d: "Sai no Diário qui/sex", I: Calendar },
+        ].map((a) => (
+          <button key={a.id} onClick={() => quick(a.id)} className="card text-left appfont" style={{ padding: "14px 16px", cursor: "pointer" }}>
+            <div className="flex items-center gap-3">
+              <span style={{ width: 40, height: 40, borderRadius: 12, background: "rgba(201,168,76,.16)", border: "1px solid rgba(201,168,76,.45)", display: "inline-flex", alignItems: "center", justifyContent: "center", color: T.goldDark, flexShrink: 0 }}><a.I size={19} /></span>
+              <span style={{ flex: 1, minWidth: 0 }}>
+                <span style={{ display: "block", fontSize: 15, fontWeight: 700, color: T.ink }}>{a.t}</span>
+                <span style={{ display: "block", fontSize: 12.5, color: T.ink2 }}>{a.d}</span>
+              </span>
+              <ChevronRight size={16} style={{ color: T.gold }} />
+            </div>
+          </button>
+        ))}
+      </div>
 
       <div className="grid gap-4" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(330px, 1fr))", alignItems: "start", marginTop: 4 }}>
 
@@ -629,7 +693,61 @@ function NodeCard({ step, onCond, controls }) {
   );
 }
 
-function FlowsView({ flows, setFlows, toast }) {
+function RunPanel({ flowId, cfg, toast, addFeed }) {
+  const [cat, setCat] = useState("Prestação de Contas Anual de Gestores");
+  const [gestor, setGestor] = useState("");
+  const [muni, setMuni] = useState("");
+  const [filtros, setFiltros] = useState("");
+  const [pedidoLivre, setPedidoLivre] = useState("");
+  const [busy, setBusy] = useState(false);
+  const spe = flowId === "spe";
+  const robo = spe ? "spe" : flowId === "pauta" ? "pauta" : "diario";
+
+  const executar = async () => {
+    if (spe && !gestor.trim()) { toast("Diga o nome do gestor. Sem chute."); return; }
+    setBusy(true);
+    const pedido = spe
+      ? `gestor: ${gestor.trim()}; municipio: ${muni.trim()}; categoria: ${cat}; filtros: ${filtros.trim()}`
+      : pedidoLivre.trim();
+    const r = await dispararRobo(cfg, { robo, pedido, alvo_pedido: spe ? "spe" : "diario" });
+    setBusy(false);
+    toast(r.msg);
+    if (r.ok) addFeed("info", `Robô ${robo} disparado${spe ? ` para ${gestor.trim()}` : ""}. Sincronize em alguns minutos.`);
+  };
+
+  return (
+    <div className="card mb-5" style={{ padding: 16, borderColor: "rgba(92,138,92,.55)" }}>
+      <div className="flex items-center gap-2 mb-2"><Play size={15} style={{ color: T.green }} /><span style={{ fontSize: 14, fontWeight: 700, color: T.ink }}>Executar este fluxo agora</span></div>
+      {spe ? (
+        <>
+          <div className="flex gap-3 flex-wrap">
+            <div style={{ minWidth: 230, flex: 1 }}>
+              <label className="lbl">Tipo de acompanhamento</label>
+              <select className="in appfont" value={cat} onChange={(e) => setCat(e.target.value)}>
+                <option>Prestação de Contas Anual de Gestores</option>
+                <option>Prestação de Contas Anual de Governo</option>
+                <option>Outro (descreva nos filtros)</option>
+              </select>
+            </div>
+            <div style={{ minWidth: 180, flex: 1 }}><label className="lbl">Gestor / interessado</label><input className="in appfont" value={gestor} onChange={(e) => setGestor(e.target.value)} placeholder="Nome exato" /></div>
+          </div>
+          <div className="flex gap-3 flex-wrap mt-2">
+            <div style={{ minWidth: 180, flex: 1 }}><label className="lbl">Município jurisdicionado</label><input className="in appfont" value={muni} onChange={(e) => setMuni(e.target.value)} placeholder="Ex.: Primeira Cruz" /></div>
+            <div style={{ minWidth: 180, flex: 1 }}><label className="lbl">Filtros (opcional)</label><input className="in appfont" value={filtros} onChange={(e) => setFiltros(e.target.value)} placeholder="administração direta" /></div>
+          </div>
+        </>
+      ) : (
+        <div><label className="lbl">Pedido extra para esta rodada (opcional)</label><input className="in appfont" value={pedidoLivre} onChange={(e) => setPedidoLivre(e.target.value)} placeholder='Ex.: "procurar também o gestor Fulano de Tal"' /></div>
+      )}
+      <div className="flex items-center justify-between mt-3 flex-wrap gap-2">
+        <span style={{ fontSize: 12, color: T.ink2 }}>{cfg.ghToken ? "O robô roda na nuvem e o resultado entra sozinho na sincronização." : "Falta o token do GitHub em Ajustes para disparar daqui (1 min para criar)."}</span>
+        <button className="btng appfont" onClick={executar} disabled={busy}>{busy ? <Loader2 size={15} className="animate-spin" /> : <Play size={15} />} Executar robô</button>
+      </div>
+    </div>
+  );
+}
+
+function FlowsView({ flows, setFlows, toast, forcedOpen, clearForced, cfg, addFeed }) {
   const [openId, setOpenId] = useState(null);
   const [nl, setNl] = useState("");
   const [busy, setBusy] = useState(false);
@@ -637,6 +755,8 @@ function FlowsView({ flows, setFlows, toast }) {
   const [newDesc, setNewDesc] = useState("");
   const [manual, setManual] = useState(false);
   const open = flows.find((f) => f.id === openId);
+
+  useEffect(() => { if (forcedOpen) { setOpenId(forcedOpen); clearForced(); } }, [forcedOpen]);
 
   const validFlow = (f) => f && typeof f.name === "string" && Array.isArray(f.steps) && f.steps.every((s) => STEP_META[s.type] && typeof s.title === "string");
   const setSteps = (fid, steps) => setFlows(flows.map((f) => (f.id === fid ? { ...f, steps } : f)));
@@ -689,6 +809,10 @@ function FlowsView({ flows, setFlows, toast }) {
           </div>
         </div>
 
+
+        {["spe", "doe14", "pauta"].includes(open.id) && (
+          <RunPanel flowId={open.id} cfg={cfg} toast={toast} addFeed={addFeed} />
+        )}
         <div className="card mb-5" style={{ padding: 16, borderColor: "rgba(201,168,76,.7)" }}>
           <div className="flex items-center gap-2 mb-2"><Wand2 size={15} style={{ color: T.gold }} /><span style={{ fontSize: 14, fontWeight: 700, color: T.ink }}>Mudar o fluxo escrevendo</span></div>
           <div className="flex gap-2 flex-wrap items-center">
@@ -1016,6 +1140,7 @@ function DocsView({ docs, setDocs, templates, setTemplates, openWord, toast }) {
                 <span className="flex items-center gap-1" style={{ fontSize: 13, color: T.green, fontWeight: 600 }}><BadgeCheck size={14} /> Aprovado</span>
                 <button className="pill appfont" style={{ padding: "6px 12px", fontSize: 13 }} onClick={() => downloadDoc((d.name || "documento").replace(/[^\wÀ-ú\- ]/g, "").slice(0, 60) || "documento", d.html)}><Download size={13} /> Baixar .doc</button>
                 <button className="pill appfont" style={{ padding: "6px 12px", fontSize: 13 }} onClick={() => mail(d)} disabled={mailBusy === d.id}>{mailBusy === d.id ? <Loader2 size={13} className="animate-spin" /> : <Mail size={13} />} E-mail</button>
+                <button className="pill appfont" style={{ padding: "6px 12px", fontSize: 13 }} onClick={() => abrirNoClaude("refinar o documento " + d.name + " (modelo " + d.tpl + ")", (d.html || "").replace(/<[^>]+>/g, " ").slice(0, 9000), toast)}><ExternalLink size={13} /> Refinar no Claude</button>
               </>
             ) : (
               <button className="btng appfont" style={{ padding: "8px 14px", fontSize: 13.5 }} onClick={() => approve(d.id)}><Check size={13} /> Aprovar</button>
@@ -1099,7 +1224,22 @@ function RobosView({ cfg, toast }) {
 
   return (
     <div className="fade-up">
-      <Title sub="Peça fora da rotina em português. Pedido ambíguo não vira chute: o robô devolve uma pergunta. As respostas entram pelo botão Robô (.json) no Hoje.">Robôs</Title>
+      <Title sub="Peça fora da rotina em português. Pedido ambíguo não vira chute: o robô devolve uma pergunta. As respostas entram sozinhas pela sincronização.">Robôs</Title>
+
+      {(() => { let spe = null; try { spe = JSON.parse(localStorage.getItem("gab-spe-last") || "null"); } catch (e) {}
+        return spe ? (
+          <div className="card mb-5" style={{ padding: 16 }}>
+            <div className="flex items-center justify-between flex-wrap gap-2 mb-1">
+              <span style={{ fontSize: 15, fontWeight: 700, color: T.ink }}>Última resposta do SPE · {spe.interessado || "consulta"}</span>
+              <button className="pill appfont" style={{ fontSize: 13 }} onClick={() => abrirNoClaude("montar o Relatório de Acompanhamento Processual (REL-02) do gestor " + (spe.interessado || ""), JSON.stringify(spe).slice(0, 9000), toast)}><ExternalLink size={14} /> Montar relatório no Claude</button>
+            </div>
+            {spe.status === "duvida" ? (
+              <p style={{ fontSize: 14, color: T.wine, margin: 0 }}>O robô perguntou: {spe.pergunta}</p>
+            ) : (
+              <p style={{ fontSize: 14, color: T.ink2, margin: 0 }}>{(spe.linhas_brutas || []).length} linhas extraídas{spe.filtros_aplicados && spe.filtros_aplicados.length ? " · filtros: " + spe.filtros_aplicados.join(", ") : ""}. Gerado em {spe.gerado_em ? new Date(spe.gerado_em).toLocaleString("pt-BR") : ""}.</p>
+            )}
+          </div>
+        ) : null; })()}
 
       <div className="card mb-5" style={{ padding: 18, borderColor: "rgba(201,168,76,.7)" }}>
         <p style={{ fontSize: 14, fontWeight: 700, color: T.ink, margin: "0 0 12px" }}>Novo pedido ao robô</p>
@@ -1181,6 +1321,12 @@ function CfgView({ cfg, setCfg, toast }) {
         <input type="password" className="in appfont" value={f.claudeKey} onChange={(e) => setF({ ...f, claudeKey: e.target.value })} placeholder="sk-ant-..." />
         <label className="lbl" style={{ marginTop: 14 }}>Repositório dos robôs no GitHub</label>
         <input className="in appfont" value={f.repoUrl} onChange={(e) => setF({ ...f, repoUrl: e.target.value })} placeholder="https://github.com/usuario/gabinete-robos" />
+        <label className="lbl" style={{ marginTop: 14 }}>Token do GitHub (para disparar robôs daqui)</label>
+        <input type="password" className="in appfont" value={f.ghToken} onChange={(e) => setF({ ...f, ghToken: e.target.value })} placeholder="github_pat_..." />
+        <p style={{ fontSize: 13, color: T.ink2, margin: "6px 0 0" }}>Como criar em 1 minuto: GitHub, Settings, Developer settings, Fine-grained tokens, Generate. Repositório: só o gabinete-robos. Permissões: Actions (leitura e escrita) e Contents (leitura). Cole aqui.</p>
+        <label className="lbl" style={{ marginTop: 14 }}>Planilha de prazos da Dra. Bruna (CSV publicado)</label>
+        <input className="in appfont" value={f.sheetCsvUrl} onChange={(e) => setF({ ...f, sheetCsvUrl: e.target.value })} placeholder="https://docs.google.com/spreadsheets/d/e/....../pub?output=csv" />
+        <p style={{ fontSize: 13, color: T.ink2, margin: "6px 0 0" }}>Na planilha: Arquivo, Compartilhar, Publicar na web, escolher a aba, CSV, copiar o link. O app passa a ler os prazos sozinho (colunas: título; responsável; dias).</p>
         <div className="flex justify-end mt-4"><button className="btng appfont" onClick={salvar}><Check size={15} /> Salvar</button></div>
       </div>
       <p style={{ fontSize: 13, color: T.ink2, marginTop: 14, maxWidth: 680, lineHeight: 1.55 }}>
@@ -1204,6 +1350,9 @@ export default function Sistema() {
   const [wordDoc, setWordDoc] = useState(null);
   const [toastMsg, setToastMsg] = useState(null);
   const [cfg, setCfg] = useState(loadCfg());
+  const [syncing, setSyncing] = useState(false);
+  const [lastSync, setLastSync] = useState(() => { try { return JSON.parse(localStorage.getItem("gab-sync-meta") || "null"); } catch (e) { return null; } });
+  const [flowOpen, setFlowOpen] = useState(null);
   const [loaded, setLoaded] = useState(false);
 
   useEffect(() => {
@@ -1226,6 +1375,78 @@ export default function Sistema() {
   useEffect(() => P("gab-feed-v6", feed), [feed, loaded]);
 
   const toast = (m) => { setToastMsg(m); setTimeout(() => setToastMsg(null), 2800); };
+  const syncNow = async (silent) => {
+    if (syncing) return;
+    if (!parseRepo(cfg)) { if (!silent) toast("Configure o repositório dos robôs em Ajustes."); return; }
+    setSyncing(true);
+    try {
+      const feitos = new Set(JSON.parse(localStorage.getItem("gab-sync-files") || "[]"));
+      const arquivos = (await listarArquivosRobos(cfg)).slice(0, 8);
+      let novos = 0, prazosNovos = 0;
+      const feedItems = []; const dl = [...deadlines];
+      for (const f of arquivos) {
+        if (feitos.has(f.name)) continue;
+        const r = await fetch(f.download_url);
+        if (!r.ok) continue;
+        const d = await r.json();
+        if (d.robo === "spe") {
+          localStorage.setItem("gab-spe-last", JSON.stringify(d));
+          feedItems.push({ id: Date.now() + Math.random(), kind: "despacho", text: d.status === "duvida" ? `Robô SPE perguntou: ${d.pergunta}` : `SPE: ${d.linhas_brutas ? d.linhas_brutas.length : 0} linhas para ${d.interessado || "consulta"}`, ago: "robô", pinned: false });
+          novos++;
+        } else {
+          for (const pb of (d.publicacoes || []).slice(0, 10)) {
+            const tag = ((pb.tags && pb.tags[0]) || "OUTRO").toUpperCase();
+            const kind = tag.includes("MULTA") || pb.urgente ? "prazo" : tag.includes("PAUTA") ? "pauta" : "doe";
+            feedItems.push({ id: Date.now() + Math.random(), kind, text: `${pb.municipio}: ${(pb.resumo_ia || pb.trecho || "").slice(0, 120)}`, ago: `Diário ${d.edicao || ""}`, pinned: false });
+            if (pb.urgente && pb.prazo_dias && !dl.some((x) => x.title === (pb.trecho || "").slice(0, 70))) {
+              dl.push({ id: Date.now() + Math.random(), title: (pb.trecho || "Prazo do Diário").slice(0, 70), who: pb.municipio || "", days: parseInt(pb.prazo_dias, 10) || 15 });
+              prazosNovos++;
+            }
+            novos++;
+          }
+          for (const rp of (d.respostas_pedidos || [])) {
+            feedItems.push({ id: Date.now() + Math.random(), kind: "info", text: rp.status === "duvida" ? `Robô perguntou: ${rp.pergunta}` : `Pedido ${rp.id}: ${(rp.achados || []).length} achados`, ago: "robô", pinned: false });
+          }
+        }
+        feitos.add(f.name);
+      }
+      if (feedItems.length) setFeed((fd) => [...feedItems, ...fd].slice(0, 60));
+      if (prazosNovos) setDeadlines(dl.sort((a, b) => a.days - b.days));
+      localStorage.setItem("gab-sync-files", JSON.stringify([...feitos].slice(-200)));
+      const meta = { quando: Date.now() };
+      localStorage.setItem("gab-sync-meta", JSON.stringify(meta));
+      setLastSync(meta);
+      if (!silent) toast(novos ? `${novos} novidades dos robôs${prazosNovos ? `, ${prazosNovos} prazos` : ""}` : "Nada novo dos robôs por enquanto.");
+    } catch (e) {
+      if (!silent) toast(e.message || "Falha ao sincronizar com o GitHub.");
+    }
+    setSyncing(false);
+  };
+
+  const lerPlanilha = async (silent) => {
+    if (!cfg.sheetCsvUrl) return;
+    try {
+      const r = await fetch(cfg.sheetCsvUrl);
+      if (!r.ok) throw new Error("planilha respondeu " + r.status);
+      const rows = parseCsvPrazos(await r.text());
+      if (!rows.length) { if (!silent) toast("Li a planilha, mas não reconheci linhas (título; responsável; dias)."); return; }
+      setDeadlines((atual) => {
+        const chaves = new Set(atual.map((d) => d.title + "|" + d.who));
+        const novos = rows.filter((x) => !chaves.has(x.title + "|" + x.who)).map((x) => ({ id: Date.now() + Math.random(), ...x }));
+        if (novos.length && !silent) toast(`${novos.length} prazos vindos da planilha da Dra. Bruna`);
+        return [...atual, ...novos].sort((a, b) => a.days - b.days);
+      });
+    } catch (e) { if (!silent) toast("Não consegui ler a planilha publicada. Confira o endereço em Ajustes."); }
+  };
+
+  useEffect(() => {
+    const meta = lastSync && lastSync.quando ? Date.now() - lastSync.quando : Infinity;
+    if (parseRepo(cfg) && meta > 10 * 60 * 1000) syncNow(true);
+    lerPlanilha(true);
+  }, [cfg.repoUrl, cfg.sheetCsvUrl]);
+
+  const quick = (id) => { setFlowOpen(id === "spe" ? "spe" : id); setView("flows"); };
+
   const pushDoc = (d) => setDocs((p) => [{ id: Date.now(), ok: false, ...d }, ...p]);
   const addFeed = (kind, text) => setFeed((f) => [{ id: Date.now() + Math.random(), kind, text }, ...f].slice(0, 40));
 
@@ -1259,7 +1480,7 @@ export default function Sistema() {
         <div className="panel glass">
           <div className="panel-head">
             <span className="glass-d" style={{ borderRadius: 999, padding: "6px 14px", fontSize: 13.5, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 8 }}>
-              Gabinete <span className="mono" style={{ fontSize: 10.5, opacity: .55 }}>nome provisório · v0.8</span>
+              Gabinete <span className="mono" style={{ fontSize: 10.5, opacity: .55 }}>nome provisório · v0.9</span>
             </span>
             <span style={{ fontSize: 13, color: T.ink2 }}>Adriana Matos Advocacia</span>
             <button onClick={() => setView("cfg")} title="Ajustes" className="cbtn" style={{ width: 38, height: 38, marginLeft: "auto" }}><Settings size={17} /></button>
@@ -1271,9 +1492,9 @@ export default function Sistema() {
           </div>
 
           <div className="panel-body scroll-thin">
-            {view === "home" && <HomeView deadlines={deadlines} setDeadlines={setDeadlines} monitors={monitors} categories={categories} feed={feed} setFeed={setFeed} addFeed={addFeed} go={setView} toast={toast} />}
+            {view === "home" && <HomeView deadlines={deadlines} setDeadlines={setDeadlines} monitors={monitors} categories={categories} feed={feed} setFeed={setFeed} addFeed={addFeed} go={setView} toast={toast} syncNow={syncNow} syncing={syncing} quick={quick} cfg={cfg} />}
             {view === "chat" && <ChatView />}
-            {view === "flows" && <FlowsView flows={flows} setFlows={setFlows} toast={toast} />}
+            {view === "flows" && <FlowsView flows={flows} setFlows={setFlows} toast={toast} forcedOpen={flowOpen} clearForced={() => setFlowOpen(null)} cfg={cfg} addFeed={addFeed} />}
             {view === "acomp" && <AcompView categories={categories} setCategories={setCategories} monitors={monitors} setMonitors={setMonitors} templates={templates} pushDoc={pushDoc} addFeed={addFeed} toast={toast} />}
             {view === "docs" && <DocsView docs={docs} setDocs={setDocs} templates={templates} setTemplates={setTemplates} openWord={setWordDoc} toast={toast} />}
             {view === "robos" && <RobosView cfg={cfg} toast={toast} />}
@@ -1282,7 +1503,7 @@ export default function Sistema() {
 
           <div className="panel-foot">
             <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}><CircleDot size={8} style={{ color: (cfg.geminiKey || cfg.claudeKey) ? T.green : T.gold }} /> {(cfg.claudeKey && cfg.provider === "claude") ? "IA: Claude" : cfg.geminiKey ? "IA: Gemini (nível gratuito)" : "IA: configurar em Ajustes"}</span>
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}><CircleDot size={8} style={{ color: "rgba(38,34,27,.3)" }} /> Robô SPE/DOE · fase 1</span>
+            <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}><CircleDot size={8} style={{ color: parseRepo(cfg) ? T.green : "rgba(38,34,27,.3)" }} /> {parseRepo(cfg) ? (lastSync ? "Robôs: sincronizado " + new Date(lastSync.quando).toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" }) : "Robôs: conectado") : "Robôs: configurar em Ajustes"}</span>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}><CircleDot size={8} style={{ color: "rgba(38,34,27,.3)" }} /> Astrea · fase 2</span>
             <span style={{ display: "inline-flex", alignItems: "center", gap: 5 }}><CircleDot size={8} style={{ color: T.gold }} /> Planilha via importar/exportar</span>
           </div>
