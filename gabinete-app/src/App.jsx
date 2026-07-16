@@ -1480,7 +1480,7 @@ export default function Sistema() {
         <div className="panel glass">
           <div className="panel-head">
             <span className="glass-d" style={{ borderRadius: 999, padding: "6px 14px", fontSize: 13.5, fontWeight: 600, display: "inline-flex", alignItems: "center", gap: 8 }}>
-              Gabinete <span className="mono" style={{ fontSize: 10.5, opacity: .55 }}>nome provisório · v0.9</span>
+              CENTRAL ADMOS <span className="mono" style={{ fontSize: 10.5, opacity: .55 }}>Props · v0.9</span>
             </span>
             <span style={{ fontSize: 13, color: T.ink2 }}>Adriana Matos Advocacia</span>
             <button onClick={() => setView("cfg")} title="Ajustes" className="cbtn" style={{ width: 38, height: 38, marginLeft: "auto" }}><Settings size={17} /></button>
